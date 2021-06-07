@@ -1,0 +1,191 @@
+---
+- name: Crear instancia CentOS 7 GCP
+  hosts: localhost
+  gather_facts: no
+  vars:
+      gcp_project: cohesive-ridge-315901
+      gcp_cred_kind: serviceaccount
+      gcp_cred_file: /home/cohesive-ridge-315901-81614cc873ec.json
+      zone: "us-central1-a"
+      region: "us-central1"
+
+  tasks:
+   - name: crear disco
+     gcp_compute_disk:
+         name: 'disco vm centOS7'
+         size_gb: 20
+         source_image: 'projects/centos-cloud/global/images/centos-7-v20210512'
+         zone: "{{ zone }}"
+         project: "{{ gcp_project }}"
+         auth_kind: "{{ gcp_cred_kind }}"
+         service_account_file: "{{ gcp_cred_file }}"
+         scopes:
+           - https://www.googleapis.com/auth/compute
+         state: present
+     register: disk
+
+   - name: crear address 
+     gcp_compute_address:
+         name: 'address-instance'
+         region: "{{ region }}"
+         project: "{{ gcp_project }}"
+         auth_kind: "{{ gcp_cred_kind }}"
+         service_account_file: "{{ gcp_cred_file }}"
+         scopes:
+           - https://www.googleapis.com/auth/compute
+         state: present
+     register: address
+
+   - name: crear instancia
+     gcp_compute_instance:
+         state: present
+         name: test-vm
+         machine_type: n1-standard-1
+         disks:
+           - auto_delete: true
+             boot: true
+             source: "{{ disk }}"
+         network_interfaces:
+             - network: null # use default
+               access_configs:
+                 - name: 'External NAT'
+                   nat_ip: "{{ address }}"
+                   type: 'ONE_TO_ONE_NAT'
+         zone: "{{ zone }}"
+         project: "{{ gcp_project }}"
+         auth_kind: "{{ gcp_cred_kind }}"
+         service_account_file: "{{ gcp_cred_file }}"
+         scopes:
+           - https://www.googleapis.com/auth/compute
+     register: instance
+
+   - name: Wait for SSH to come up
+     wait_for: host={{ address.address }} port=22 delay=10 timeout=60
+
+   - name: Add host to groupname
+     add_host: hostname={{ address.address }} groupname=new_instances
+
+
+- name: Instancia nueva
+  hosts: new_instances
+  connection: ssh
+  become: True
+  become_user: root
+  roles:
+    - base_configuration
+    - production_server 
+  tasks:
+    - name: Install yum
+      yum:
+        name:
+          - wget
+          - java-1.8.0-openjdk
+ 
+    - name: descargar jenkins.repo
+      get_url:
+        url: http://pkg.jenkins-ci.org/redhat-stable/jenkins.repo
+        dest: /etc/yum.repos.d/jenkins.repo
+ 
+    - name: importar jenkins-key
+      rpm_key:
+        state: present
+        key: https://jenkins-ci.org/redhat/jenkins-ci.org.key
+ 
+    - name: instalar Jenkins
+      yum:
+        name: jenkins
+        state: present
+ 
+    - name: arrancar y avilitar Jenkins
+      systemd:
+        name: jenkins
+        state: started
+        enabled: true
+ 
+    - name: pausa 30 segundos y continúa ejecución.
+      wait_for: timeout=30
+ 
+    - name: Obtener la contraseña de inicio para Jenkins
+      shell: cat /var/lib/jenkins/secrets/initialAdminPassword
+      changed_when: false
+      register: result
+ 
+    - name: Print de contraseña de inicio Jenkins
+      debug:
+        var: result.stdout
+
+    - name: Instalar plugin
+      jenkins_plugin:
+      name: build-pipeline-plugin
+    
+    - name: Descargar JUnit 4.11 de Maven Central
+      community.general.maven_artifact:
+        group_id: junit
+        artifact_id: junit
+        version: 4.11
+        dest: /tmp/junit-4.11.jar
+       register: maven
+
+- name: Job Jeankis java
+  hosts: new_instances
+  connection: ssh
+  become: True
+  become_user: root
+  roles:
+  - "{{ maven }}"
+  tasks:
+  
+    - name: Crear un trabajo  jenkins usando autentificacion basica
+      community.general.jenkins_job:
+        config: "{{ lookup('file', 'templates/test.xml') }}"
+        name: test
+        password: "{{ result }}"
+        url: http://localhost:8080
+        user: admin
+
+    - include_role:
+        name: tomcat
+
+    - name: Instalar Java 1.7
+      yum: name=java-1.7.0-openjdk state=present
+
+    - name: agregar al grupo "tomcat"
+      group: name={{tomcat_group}}
+
+    - name: agregar ususario "tomcat"
+      user: name={{tomcat_user}} group={{tomcat_group}} home=/usr/share/tomcat createhome=no
+     
+    - name: Descargar Tomcat
+      get_url: url=http://archive.apache.org/dist/tomcat/tomcat-7/v7.0.61/bin/apache-tomcat-7.0.61.tar.gz dest=/opt/apache-tomcat-7.0.61.tar.gz
+
+    - name: Extraer archive
+      command: chdir=/usr/share /bin/tar xvf /opt/apache-tomcat-7.0.61.tar.gz -C /opt/ creates=/opt/apache-tomcat-7.0.61
+
+    - name: Instalacion del directorio Symlink
+      file: src=/opt/apache-tomcat-7.0.61 path=/usr/share/tomcat state=link
+
+    - name: Change ownership of Tomcat installation
+      file: path=/usr/share/tomcat/ owner=tomcat group=tomcat state=directory recurse=yes
+
+    - name: Configurar Servidor Tomcat 
+      template: src=server.xml dest=/usr/share/tomcat/conf/
+
+    - name: Crear directorio de nuestra 
+      file:
+      path: "/opt/apache-tomcat-7.0.61/webapps/samples"
+      state: directory
+      mode: 0777
+      become: true
+
+    - name: Copiar archivo war
+      copy: src=./target/LoginWebApp-1.war dest=/opt/apache-tomcat-7.0.61/webapps/
+      notify: restart tomcat
+      
+    - name: Instalar script Tomcat
+      copy: src=tomcat-initscript.sh dest=/etc/init.d/tomcat mode=0755
+
+    - name: Iniciar Tomcat
+      service: name=tomcat state=started enabled=yes
+
+    - name: Esperar que Tomcat inicie
+      wait_for: port={{http_port}}
